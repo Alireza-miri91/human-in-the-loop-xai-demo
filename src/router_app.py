@@ -111,7 +111,7 @@ def _log_new_user(pid, group):
         "ts": time.time(),
         "pid": pid,
         "group": group,
-        "note": "First-time demo visitor",
+        "note": "First-time demo visitor"
     }
     with _LOCK:
         with open(NEW_USERS_LOG, "a", encoding="utf-8") as f:
