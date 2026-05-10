@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+.ipynb_checkpoints/
+
+# Local runtime artifacts. These may contain demo submissions or session data.
+runtime_data/*
+!runtime_data/.gitkeep
+.pytest_cache/
+
+# Study/private artifacts that should never be published.
+responses/
+responses_Control_Group/
+responses_Treatment_Group/
+*.jsonl
+cookies*.txt
+survey_results.csv
+post_study_statistics.csv
+analysis_output/
+analysis_summary.txt
+prel_anlys.ipynb
+backup.txt
+
+# Generated plots and reports.
+figures/
+*.png
+*.pdf

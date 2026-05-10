@@ -1,0 +1,12 @@
+Flask
+Werkzeug
+cvxpy
+matplotlib
+numpy
+pandas
+pytest
+requests
+scikit-learn
+scipy
+seaborn
+torch
