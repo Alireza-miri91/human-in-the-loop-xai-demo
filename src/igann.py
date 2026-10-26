@@ -39,6 +39,20 @@ class torch_Ridge:
         return X.to(self.device) @ self.coef_
 
 
+def _validated_cvxpy_solution(problem, variable, context, tolerance=1e-5):
+    """Reject non-optimal, non-finite, or numerically infeasible CVXPY results."""
+    if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+        raise RuntimeError(f"{context}: solver status is {problem.status!r}")
+    result = variable.value
+    if result is None or not np.all(np.isfinite(result)):
+        raise RuntimeError(f"{context}: solver returned missing or non-finite values")
+    for constraint in problem.constraints:
+        violation = np.asarray(constraint.violation())
+        if not np.all(np.isfinite(violation)) or np.max(violation) > tolerance:
+            raise RuntimeError(f"{context}: constraint violation exceeds {tolerance}")
+    return result
+
+
 def cvxpy_logistic_monotonic(X, y, mon_inc_signs, lambda_reg=1e-3):
     """
     Solve logistic regression with monotonic constraints using CVXPY.
@@ -72,15 +86,10 @@ def cvxpy_logistic_monotonic(X, y, mon_inc_signs, lambda_reg=1e-3):
         else:
             constraints.append(beta[j] <= 0)
 
-    try:
-        prob = cp.Problem(objective, constraints)
-        prob.solve()
-        beta_opt = beta.value
-        b_opt = b.value
-    except Exception as e:
-        warnings.warn(f"CVXPY solver failed in cvxpy_logistic_monotonic: {e}. Using zeros for beta and b.")
-        beta_opt = np.zeros(n_features)
-        b_opt = 0.0
+    prob = cp.Problem(objective, constraints)
+    prob.solve()
+    beta_opt = _validated_cvxpy_solution(prob, beta, "monotonic logistic initialization")
+    b_opt = _validated_cvxpy_solution(prob, b, "monotonic logistic initialization")
     return beta_opt, b_opt
 
 class ShiftedReLU(nn.Module):
@@ -346,14 +355,10 @@ class ELM_Regressor:
                 constraints.append(cum_imp_i + boost_rate * avg_expr_i <= cum_imp_j + boost_rate * avg_expr_j)
         '''
         
-        # Solve the problem
-        try:
-            prob = cp.Problem(objective, constraints)
-            prob.solve()
-            beta_opt = beta.value
-        except Exception as e:
-            warnings.warn(f"CVXPY solver failed in ELM_Regressor.fit: {e}. Using zeros for beta.")
-            beta_opt = np.zeros(n_features)
+        # Do not silently replace failed constrained fits with an unverified model.
+        prob = cp.Problem(objective, constraints)
+        prob.solve()
+        beta_opt = _validated_cvxpy_solution(prob, beta, "monotonic ELM optimization")
 
         m = torch_Ridge(alpha=self.elm_alpha, device=self.device)
         m.coef_ = torch.tensor(beta_opt, dtype=torch.float32).to(self.device)
@@ -370,7 +375,8 @@ class ELM_Regressor:
                 col_end = (feat + 1) * self.n_hid
                 hidden_block = self.hidden_mat[feat, col_start:col_end].detach().cpu().numpy()
                 contrib = (act_deriv[:, col_start:col_end] * hidden_block) @ beta_opt[col_start:col_end]
-                derivative_contrib[:, idx] = boost_rate * sign * contrib
+                # Track the actual derivative; the sign is used only in the inequality.
+                derivative_contrib[:, idx] = boost_rate * contrib
             derivative_contrib = torch.tensor(derivative_contrib, dtype=torch.float32).to(self.device)
         return X_hid, derivative_contrib
 
@@ -555,10 +561,27 @@ class IGANN:
             self.raw_y_val = y.iloc[val_indices]
         self._reset_state()
 
-        X_proc = self._preprocess_feature_matrix(X)
+        # Fit preprocessing and the linear initialization on training rows only.
+        # Otherwise the internal validation set leaks into the initial predictor.
+        if val_set is None:
+            X_train = self._preprocess_feature_matrix(X.iloc[train_indices].copy())
+            X_val = self._preprocess_feature_matrix(
+                X.iloc[val_indices].copy(), fit_transform=False
+            )
+            X_proc = X_train
+        else:
+            X_proc = self._preprocess_feature_matrix(X.copy())
+            X_train = X_proc
+            X_val, _ = val_set  # External validation must already be preprocessed.
+
         if isinstance(y, (pd.Series, pd.DataFrame)):
             y = y.values
         y = torch.from_numpy(y.squeeze()).float()
+        if val_set is None:
+            y_train, y_val = y[train_indices], y[val_indices]
+        else:
+            _, y_val = val_set
+            y_train = y
 
         if self.task == "classification":
             if torch.min(y) != -1:
@@ -571,8 +594,16 @@ class IGANN:
         if self.monotonicity is not None:
             for f, direction in self.monotonicity.items():
                 if f in self.numerical_cols:
+                    if direction in (0, "0", None, "none"):
+                        continue
+                    if direction in ("+1", +1):
+                        sign = 1
+                    elif direction in ("-1", -1):
+                        sign = -1
+                    else:
+                        raise ValueError(f"Invalid monotonicity direction for {f!r}: {direction!r}")
                     mon_idx.append(self.numerical_cols.index(f))
-                    mon_sign.append(1 if direction in ["+1", +1] else -1)
+                    mon_sign.append(sign)
                 else:
                     warnings.warn(f"Monotonic constraint requested for feature '{f}' which is not numerical; skipping.")
         self.mon_idx = mon_idx
@@ -581,7 +612,7 @@ class IGANN:
         if self.task == "classification":
             if self.mon_idx:
                 X_np = X_proc.cpu().numpy()
-                y_np = y.cpu().numpy()
+                y_np = y_train.cpu().numpy()
                 beta, b = cvxpy_logistic_monotonic(X_np, y_np, list(zip(self.mon_idx, self.mon_sign)), lambda_reg=self.init_reg)
                 self.linear_model = type("LinearModel", (), {})()
                 self.linear_model.coef_ = beta
@@ -593,20 +624,23 @@ class IGANN:
                     C=1 / self.init_reg,
                     random_state=self.random_state,
                 )
-                self.linear_model.fit(X_proc, y)
+                self.linear_model.fit(X_proc, y_train)
             self.criterion = lambda prediction, target: torch.nn.BCEWithLogitsLoss()(
                 prediction, torch.nn.ReLU()(target)
             )
         elif self.task == "regression":
-            # Use CVXPY if either monotonic or importance constraints are provided.
-            if self.mon_idx is not None:
+            # Unconstrained IGANN retains the original Lasso initialization.
+            if self.mon_idx:
                 X_np = X_proc.cpu().numpy()
-                y_np = y.cpu().numpy()
+                y_np = y_train.cpu().numpy()
                 n_samples, n_features = X_np.shape
                 beta = cp.Variable(n_features)
                 b = cp.Variable(1)
-                reg_term = 0.5 * self.init_reg * cp.sum_squares(beta)
-                objective = cp.Minimize(0.5 * cp.sum_squares(X_np @ beta + b - y_np) + reg_term)
+                # Match sklearn Lasso: (1 / (2n)) * ||X beta + b - y||^2 + alpha ||beta||_1.
+                reg_term = self.init_reg * cp.norm1(beta)
+                objective = cp.Minimize(
+                    0.5 / n_samples * cp.sum_squares(X_np @ beta + b - y_np) + reg_term
+                )
                 constraints = []
                 
                 # Enforce monotonicity if provided
@@ -617,8 +651,6 @@ class IGANN:
                                 constraints.append(beta[i] >= 0)
                             else:
                                 constraints.append(beta[i] <= 0)
-                constraints.append(b >= -0.1)
-                constraints.append(b <= 0.1)
                 '''
                 
                 # Enforce importance constraints if provided.
@@ -635,29 +667,19 @@ class IGANN:
                 '''
                 prob = cp.Problem(objective, constraints)
                 prob.solve()
-                coef = beta.value
-                intercept = b.value
+                coef = _validated_cvxpy_solution(prob, beta, "monotonic linear initialization")
+                intercept = _validated_cvxpy_solution(prob, b, "monotonic linear initialization")
                 self.linear_model = type("LinearModel", (), {})()
                 self.linear_model.coef_ = coef
                 self.linear_model.intercept_ = (intercept[0] if isinstance(intercept, np.ndarray) else intercept)
             else:
                 from sklearn.linear_model import Lasso
                 self.linear_model = Lasso(alpha=self.init_reg)
-                self.linear_model.fit(X_proc, y)
+                self.linear_model.fit(X_proc, y_train)
             self.criterion = torch.nn.MSELoss()
 
         else:
             warnings.warn("Task not implemented. Can be classification or regression")
-
-        if val_set is None:
-            X_train = X_proc[train_indices]
-            X_val = X_proc[val_indices]
-            y_train = y[train_indices]
-            y_val = y[val_indices]
-        else:
-            X_train = X_proc
-            y_train = y
-            X_val, y_val = val_set
 
         if self.task == "classification":
             y_hat_train = (torch.squeeze(torch.from_numpy(self.linear_model.coef_.astype(np.float32)) @ X_train.T)
